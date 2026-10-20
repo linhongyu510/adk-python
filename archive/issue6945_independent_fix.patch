@@ -1,0 +1,164 @@
+diff --git a/src/google/adk/models/gemini_context_cache_manager.py b/src/google/adk/models/gemini_context_cache_manager.py
+index bbe0d0677..9fd7fc78e 100644
+--- a/src/google/adk/models/gemini_context_cache_manager.py
++++ b/src/google/adk/models/gemini_context_cache_manager.py
+@@ -132,9 +132,10 @@ class GeminiContextCacheManager:
+         if cache_name is None:
+           raise RuntimeError("A valid cache must have active metadata.")
+         cache_contents_count = llm_request.cache_metadata.contents_count
+-        self._apply_cache_to_request(
++        if not self._apply_cache_to_request(
+             llm_request, cache_name, cache_contents_count
+-        )
++        ):
++          return None
+         return llm_request.cache_metadata.model_copy()
+       else:
+         # Invalid cache - clean it up and check if we should create new one
+@@ -176,9 +177,10 @@ class GeminiContextCacheManager:
+             cache_name = cache_metadata.cache_name
+             if cache_name is None:
+               raise RuntimeError("A newly created cache must be active.")
+-            self._apply_cache_to_request(
++            if not self._apply_cache_to_request(
+                 llm_request, cache_name, cache_contents_count
+-            )
++            ):
++              return None
+             return cache_metadata
+ 
+           # Cache creation failed (for example, below the model's minimum).
+@@ -650,14 +652,25 @@ class GeminiContextCacheManager:
+       llm_request: LlmRequest,
+       cache_name: str,
+       cache_contents_count: int,
+-  ) -> None:
++  ) -> bool:
+     """Apply cache to the request by modifying it to use cached content.
+ 
+     Args:
+         llm_request: Request to modify
+         cache_name: Name of cache to use
+         cache_contents_count: Number of contents that are cached
++
++    Returns:
++        Whether the cache was applied to the request.
+     """
++    if cache_contents_count > 0 and cache_contents_count >= len(
++        llm_request.contents
++    ):
++      logger.debug(
++          "Skipping cache application because it would leave no live contents."
++      )
++      return False
++
+     # Remove system instruction, tools, and tool config from request config since they're in cache
+     if llm_request.config:
+       llm_request.config.system_instruction = None
+@@ -669,6 +682,7 @@ class GeminiContextCacheManager:
+ 
+     # Remove cached contents from the request (keep only uncached contents)
+     llm_request.contents = llm_request.contents[cache_contents_count:]
++    return True
+ 
+   def populate_cache_metadata_in_response(
+       self, llm_response: LlmResponse, cache_metadata: CacheMetadata
+diff --git a/tests/unittests/agents/test_gemini_context_cache_manager.py b/tests/unittests/agents/test_gemini_context_cache_manager.py
+index 035016684..49cc53266 100644
+--- a/tests/unittests/agents/test_gemini_context_cache_manager.py
++++ b/tests/unittests/agents/test_gemini_context_cache_manager.py
+@@ -138,7 +138,9 @@ class TestGeminiContextCacheManager:
+ 
+     # Create request with existing valid cache
+     existing_cache = self.create_cache_metadata(invocations_used=5)
+-    llm_request = self.create_llm_request(cache_metadata=existing_cache)
++    llm_request = self.create_llm_request(
++        cache_metadata=existing_cache, contents_count=4
++    )
+ 
+     with patch.object(self.manager, "_is_cache_valid", return_value=True):
+       result = await self.manager.handle_context_caching(llm_request)
+@@ -165,6 +167,26 @@ class TestGeminiContextCacheManager:
+     # Should not create new cache
+     self.manager.genai_client.aio.caches.create.assert_not_called()
+ 
++  async def test_handle_context_caching_skips_cache_that_covers_request(self):
++    """A cache is skipped when applying it would remove all live contents."""
++    existing_cache = self.create_cache_metadata(
++        invocations_used=5, contents_count=1
++    )
++    llm_request = self.create_llm_request(
++        cache_metadata=existing_cache, contents_count=1
++    )
++    original_contents = list(llm_request.contents)
++
++    with patch.object(self.manager, "_is_cache_valid", return_value=True):
++      result = await self.manager.handle_context_caching(llm_request)
++
++    assert result is None
++    assert llm_request.contents == original_contents
++    assert llm_request.config.cached_content is None
++    assert llm_request.config.system_instruction is not None
++    assert llm_request.config.tools is not None
++    assert llm_request.config.tool_config is not None
++
+   async def test_handle_context_caching_invalid_cache_fingerprint_match(self):
+     """Test invalid cache with matching fingerprint creates new cache."""
+     # Setup mocks
+@@ -180,7 +202,9 @@ class TestGeminiContextCacheManager:
+     existing_cache = self.create_cache_metadata(
+         invocations_used=15
+     )  # Exceeds cache_intervals
+-    llm_request = self.create_llm_request(cache_metadata=existing_cache)
++    llm_request = self.create_llm_request(
++        cache_metadata=existing_cache, contents_count=4
++    )
+     llm_request.cacheable_contents_token_count = (
+         5000  # Above Gemini's 4096 minimum for cache creation
+     )
+@@ -344,6 +368,45 @@ class TestGeminiContextCacheManager:
+     assert create_config.contents == [first_user, first_model]
+     assert next_request.contents == [next_user]
+ 
++  def test_apply_cache_removes_only_cached_prefix(self):
++    """Applying a cache keeps all contents after the cached prefix."""
++    llm_request = self.create_llm_request(contents_count=3)
++    original_contents = list(llm_request.contents)
++
++    applied = self.manager._apply_cache_to_request(
++        llm_request,
++        cache_name="cachedContents/test",
++        cache_contents_count=2,
++    )
++
++    assert applied is True
++    assert llm_request.contents == original_contents[2:]
++    assert llm_request.config.cached_content == "cachedContents/test"
++
++  @pytest.mark.parametrize("cache_contents_count", [1, 2])
++  def test_apply_cache_skips_cache_when_prefix_covers_request(
++      self, cache_contents_count
++  ):
++    """A cache that covers the request leaves the request unchanged."""
++    llm_request = self.create_llm_request(contents_count=1)
++    original_contents = list(llm_request.contents)
++    original_system_instruction = llm_request.config.system_instruction
++    original_tools = llm_request.config.tools
++    original_tool_config = llm_request.config.tool_config
++
++    applied = self.manager._apply_cache_to_request(
++        llm_request,
++        cache_name="cachedContents/test",
++        cache_contents_count=cache_contents_count,
++    )
++
++    assert applied is False
++    assert llm_request.contents == original_contents
++    assert llm_request.config.cached_content is None
++    assert llm_request.config.system_instruction is original_system_instruction
++    assert llm_request.config.tools is original_tools
++    assert llm_request.config.tool_config is original_tool_config
++
+   async def test_gemini_25_creates_cache_above_2048_token_minimum(self):
+     """Gemini 2.5 creates an explicit cache above its 2,048-token floor."""
+     llm_request = self.create_llm_request(contents_count=0)
